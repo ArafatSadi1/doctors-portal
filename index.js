@@ -1,12 +1,13 @@
 const express = require("express");
 const app = express();
 const jwt = require("jsonwebtoken");
-const { MongoClient, ServerApiVersion } = require("mongodb");
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const cors = require("cors");
 const port = process.env.PORT || 5000;
 require("dotenv").config();
 var nodemailer = require("nodemailer");
 var sgTransport = require("nodemailer-sendgrid-transport");
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 // middleware
 app.use(cors());
@@ -22,7 +23,7 @@ const client = new MongoClient(uri, {
 const verifyJwt = (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) {
-    return res.statue(401).send({ message: "Unauthorized access" });
+    return res.status(401).send({ message: "Unauthorized access" });
   }
   const token = authHeader.split(" ")[1];
   jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
@@ -72,6 +73,38 @@ function sendAppointmentEmail(bookingInfo) {
   });
 }
 
+
+function sendPaymentEmail(bookingInfo) {
+  const { treatment, date, slot, patient, patientName, transactionId } = bookingInfo;
+
+  const email = {
+    from: process.env.EMAIL_SENDER,
+    to: patient,
+    subject: `Your Payment is Confirm for ${treatment} is on ${date} at ${slot}`,
+    text: `Your Payment is Confirm for ${treatment} is on ${date} at ${slot}`,
+    html: `
+        <div>
+        <p>Hello ${patientName}</p>
+        <h3>Your Appointment for ${treatment} is confirmed</h3>
+        <p>Thanks For Payment. Your Transaction Id Is: ${transactionId}</p>
+        <p>Looking forward to seeing you on ${date} at ${slot}.</p>
+        <h3>Our Address</h3>
+        <p>amdorkilla bandorbon</p>
+        <p>Bangladesh</p>
+        <a href="https://www.programming-hero.com/">Unsubscribe</a>
+        </div>
+        `,
+  };
+
+  EmailClient.sendMail(email, function (err, info) {
+    if (err) {
+      console.log(err);
+    } else {
+      console.log("Message sent: ", info);
+    }
+  });
+}
+
 async function run() {
   try {
     await client.connect();
@@ -83,6 +116,7 @@ async function run() {
       .collection("booking-info");
     const userCollection = client.db("doctors_portal").collection("user");
     const doctorCollection = client.db("doctors_portal").collection("doctor");
+    const paymentsCollection = client.db("doctors_portal").collection("payment");
 
     const verifyAdmin = async (req, res, next) => {
       const requester = req.decoded.email;
@@ -95,6 +129,18 @@ async function run() {
         res.status(403).send({ message: "forbidden" });
       }
     };
+
+    app.post('/create-payment-intent', async(req, res)=>{
+      const service = req.body;
+      const price = service.price;
+      const amount = price * 100;
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: 'usd',
+        payment_method_types: ['card']
+      })
+      res.send({clientSecret: paymentIntent.client_secret})
+    })
 
     app.get("/user", verifyJwt, async (req, res) => {
       const result = await userCollection.find().toArray();
@@ -168,6 +214,30 @@ async function run() {
         return res.status(403).send({ message: "Forbidden access" });
       }
     });
+
+    app.get("/bookingInfo/:id", verifyJwt, async (req, res) => {
+      const id = req.params.id;
+      const query = {_id: ObjectId(id)};
+      const result = await bookingInfoCollection.findOne(query);
+      res.send(result)
+    })
+
+    app.patch("/bookingInfo/:id", verifyJwt, async (req, res) => {
+      const id = req.params.id;
+      const booking = req.body;
+      const {appointmentId, transactionId} = booking; 
+      const filter = {_id: ObjectId(id)};
+      const updatedDoc = {
+        $set: {
+          paid: true,
+          transactionId: booking.transactionId,
+        }
+      }
+      const result = await paymentsCollection.insertOne({appointmentId, transactionId});
+      const updatedBooking = await bookingInfoCollection.updateOne(filter, updatedDoc);
+      sendPaymentEmail(booking)
+      res.send(updatedBooking)
+    })
 
     app.post("/bookingInfo", async (req, res) => {
       const bookingInfo = req.body;
